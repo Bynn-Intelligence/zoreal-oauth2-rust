@@ -221,7 +221,7 @@ of the underlying identity proofing. The block's schema is
 |---|---|
 | `authenticate(code, code_verifier, nonce, acr_floor)` | `exchange` + `verify_id_token`, returns a `Login` |
 | `exchange(code, code_verifier)` | `POST {issuer}/token` with your client authentication, returns a `TokenResponse` |
-| `verify_id_token(jwt, nonce, acr_floor)` | ES256 against `{issuer}/jwks`; checks `iss` exactly, `aud`, `exp` (30 s leeway), `nbf` and `iat` when present, the `nonce` (mandatory), and the floor. Returns the `IdTokenClaims` |
+| `verify_id_token(jwt, nonce, acr_floor)` | ES256 against `{issuer}/jwks`; checks `iss` exactly, `aud`, `exp` and `iat` (both required, 30 s leeway), `nbf` when present, the `nonce` (mandatory), and the floor. Returns the `IdTokenClaims` |
 | `userinfo(&access_token)` | `GET {issuer}/userinfo` with the Bearer token, returns `Userinfo` |
 | `Login::userinfo()` | the above, once, kept; empty when there is no access token; refused if its `sub` is missing or differs from the ID token's |
 

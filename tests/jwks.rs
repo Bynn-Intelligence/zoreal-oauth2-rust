@@ -91,19 +91,24 @@ async fn the_set_is_refreshed_ahead_of_expiry() {
 }
 
 #[tokio::test]
-async fn a_token_without_kid_verifies_against_a_single_key_set_only() {
+async fn a_token_without_kid_is_tried_against_at_most_four_keys() {
     let p = Provider::start().await;
-    let other = Key::generate("key-2");
+    let others: Vec<Key> = (2..=5)
+        .map(|i| Key::generate(&format!("key-{i}")))
+        .collect();
+    // First fetch: the signer is the second key. Later: the signer is fifth.
+    let early: Vec<&Key> = vec![&others[0], &p.key, &others[1]];
+    let late: Vec<&Key> = others.iter().chain(std::iter::once(&p.key)).collect();
     Mock::given(method("GET"))
         .and(path("/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(jwks(&[&p.key])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(jwks(&early)))
         .up_to_n_times(1)
         .with_priority(1)
         .mount(&p.server)
         .await;
     Mock::given(method("GET"))
         .and(path("/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(jwks(&[&p.key, &other])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(jwks(&late)))
         .with_priority(2)
         .mount(&p.server)
         .await;
@@ -115,7 +120,7 @@ async fn a_token_without_kid_verifies_against_a_single_key_set_only() {
         .verify_id_token(&token, NONCE, None)
         .await
         .unwrap();
-    // A fresh client sees two keys: a kid-less token matches none of them.
+    // A fresh client sees the signer fifth: past the four tries.
     assert!(
         p.client()
             .verify_id_token(&token, NONCE, None)

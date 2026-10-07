@@ -197,12 +197,16 @@ async fn an_expired_token_is_refused_beyond_the_leeway() {
 }
 
 #[tokio::test]
-async fn a_token_without_exp_is_refused() {
+async fn a_token_without_exp_or_iat_is_refused() {
     let p = Provider::start().await;
     p.serve_jwks(&[&p.key]).await;
     let token = p
         .key
         .sign(&with(base_claims(&p.issuer()), json!({ "exp": null })));
+    assert_verification(verify(&p, &token).await, "malformed");
+    let token = p
+        .key
+        .sign(&with(base_claims(&p.issuer()), json!({ "iat": null })));
     assert_verification(verify(&p, &token).await, "malformed");
 }
 

@@ -502,7 +502,7 @@ impl Client {
 
     /// Verifies a compact ID token: an ES256 signature from a key in
     /// `{issuer}/jwks`, `iss` equal to the issuer exactly, `aud` containing
-    /// the `client_id`, `exp` (and `nbf`, `iat` when present) within the
+    /// the `client_id`, `exp` and `iat` (and `nbf` when present) within the
     /// leeway, a `nonce` equal to `nonce`, and, when `acr_floor` is given,
     /// an `acr` at or above it. Returns the claims; every failure is an
     /// [`Error::Verification`].
@@ -591,10 +591,7 @@ impl Client {
         {
             return Err(Error::verification("the ID token is not valid yet"));
         }
-        if claims
-            .iat
-            .is_some_and(|iat| iat > now.saturating_add(leeway))
-        {
+        if claims.iat > now.saturating_add(leeway) {
             return Err(Error::verification("the ID token was issued in the future"));
         }
 

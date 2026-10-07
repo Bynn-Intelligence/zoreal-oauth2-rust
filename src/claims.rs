@@ -26,9 +26,8 @@ pub struct IdTokenClaims {
     pub aud: Vec<String>,
     /// Expiry, seconds since the Unix epoch.
     pub exp: i64,
-    /// Issued at, seconds since the Unix epoch.
-    #[serde(default)]
-    pub iat: Option<i64>,
+    /// Issued at, seconds since the Unix epoch. Required in an ID token.
+    pub iat: i64,
     /// When the holder authenticated, seconds since the Unix epoch.
     #[serde(default)]
     pub auth_time: Option<i64>,

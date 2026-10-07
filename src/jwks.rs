@@ -27,6 +27,8 @@ use crate::jwt::Jwk;
 /// unknown kid forces at most one refetch per this interval; a genuine key
 /// rotation needs exactly one.
 pub(crate) const FORCED_REFETCH_INTERVAL: Duration = Duration::from_secs(10);
+/// How many keys a token without a `kid` is tried against.
+pub(crate) const MAX_KIDLESS_TRIES: usize = 4;
 /// How long a failed fetch is remembered before the next attempt.
 pub(crate) const FAILURE_BACKOFF: Duration = Duration::from_secs(2);
 /// How long past its TTL a key set may still be served while refetching it
@@ -47,18 +49,21 @@ impl KeySet {
     }
 
     /// The keys to try for a token header: the one whose kid matches, or,
-    /// when the token names no kid, the only key of a single-key set.
+    /// when the token names no kid, the first [`MAX_KIDLESS_TRIES`] keys, so
+    /// a kid-less token costs a bounded number of signature checks.
     pub(crate) fn candidates<'a>(
         &'a self,
         kid: Option<&'a str>,
     ) -> impl Iterator<Item = &'a VerifyingKey> + 'a {
-        let single = self.keys.len() == 1;
+        let limit = if kid.is_some() {
+            usize::MAX
+        } else {
+            MAX_KIDLESS_TRIES
+        };
         self.keys
             .iter()
-            .filter(move |jwk| match kid {
-                Some(kid) => jwk.kid.as_deref() == Some(kid),
-                None => single,
-            })
+            .filter(move |jwk| kid.is_none() || jwk.kid.as_deref() == kid)
+            .take(limit)
             .map(|jwk| &jwk.key)
     }
 

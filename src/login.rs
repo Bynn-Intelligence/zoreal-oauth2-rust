@@ -110,7 +110,7 @@ impl Login {
     }
 
     /// Issued at, seconds since the Unix epoch.
-    pub fn iat(&self) -> Option<i64> {
+    pub fn iat(&self) -> i64 {
         self.claims.iat
     }
 
