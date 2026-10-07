@@ -1,0 +1,6 @@
+/target
+.DS_Store
+*.crate
+CLAUDE.md
+CLAUDE.local.md
+.claude/
