@@ -1,6 +1,6 @@
 [package]
 name = "zoreal-oauth2"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Sign in with ZOREAL for Rust backends: OAuth 2.0 / OpenID Connect relying-party SDK"
