@@ -223,7 +223,7 @@ of the underlying identity proofing. The block's schema is
 | `exchange(code, code_verifier)` | `POST {issuer}/token` with your client authentication, returns a `TokenResponse` |
 | `verify_id_token(jwt, nonce, acr_floor)` | ES256 against `{issuer}/jwks`; checks `iss` exactly, `aud`, `exp` (30 s leeway), `nbf` and `iat` when present, the `nonce` (mandatory), and the floor. Returns the `IdTokenClaims` |
 | `userinfo(&access_token)` | `GET {issuer}/userinfo` with the Bearer token, returns `Userinfo` |
-| `Login::userinfo()` | the above, once, kept; empty when there is no access token; refused if its `sub` differs from the ID token's |
+| `Login::userinfo()` | the above, once, kept; empty when there is no access token; refused if its `sub` is missing or differs from the ID token's |
 
 Tier A claims read straight off the `Login`: `sub()`, `acr()`, `acr_level()`,
 `amr()`, `assurance()`, `age_over(n)`, `nationality()`, `iat()`, `exp()`,
@@ -233,10 +233,18 @@ first use: `email()`, `email_verified()`, `name()`, `given_name()`,
 `issuing_country()`, `document_expires_on()` and `portrait()`.
 
 The JWKS is cached in process for ten minutes (`JWKS_TTL`, the provider's own
-cache lifetime). A token whose `kid` the cache does not hold triggers one
-refetch, so a key rotation never strands a login; forced refetches are limited
-to one per ten seconds, so forged `kid` values cannot turn verification into a
-stream of JWKS requests.
+cache lifetime), shared by every clone of the client:
+
+- it is refreshed ahead of expiry by one request while the others keep using
+  the current keys, so no login waits on the periodic refetch;
+- concurrent logins on a cold cache make one request, and a failed request is
+  not retried for two seconds, so an unhealthy endpoint is not hammered;
+- if refetching fails, the expired keys are served for up to an hour more, so
+  a brief JWKS outage does not become a login outage;
+- a token whose `kid` the cache does not hold triggers one refetch, so a key
+  rotation never strands a login, and forced refetches are limited to one per
+  ten seconds, so forged `kid` values cannot turn verification into a stream
+  of JWKS requests.
 
 ## Client authentication
 
@@ -244,7 +252,7 @@ stream of JWKS requests.
 |---|---|---|
 | `none` | `ClientAuth::None` (the default) | Public client: PKCE is the only proof, Tier A scopes only |
 | `client_secret_basic` | `.client_secret(secret)` or `ClientAuth::client_secret_basic(secret)` | The secret travels as HTTP Basic, never as a form field |
-| `private_key_jwt` | `ClientAuth::PrivateKeyJwt(PrivateKey::from_pem(pem)?.with_kid("..."))` | The crate signs a fresh RFC 7523 assertion per exchange: ES256 with a P-256 key, `iss` = `sub` = client id, `aud` = `{issuer}/token`, 60-second lifetime, single-use `jti`. The key never travels |
+| `private_key_jwt` | `ClientAuth::PrivateKeyJwt(PrivateKey::from_pem(pem)?.with_kid("..."))` | The crate signs a fresh RFC 7523 assertion per exchange: ES256 with a P-256 key, `iss` = `sub` = client id, `aud` = `{issuer}/token`, a 50-second lifetime (inside the provider's 60-second cap, with room for clock skew), single-use `jti`. The key never travels |
 | `tls_client_auth` | `ClientAuth::TlsClientAuth(TlsIdentity::from_pem(cert_chain, &key)?)` | The certificate rides the TLS handshake on every request. The provider accepts the method at registration but answers 501 at the token endpoint today, which surfaces as the `Error::Exchange` it is |
 
 `PrivateKey::from_pem` reads PKCS #8 (`BEGIN PRIVATE KEY`) and SEC1
@@ -301,7 +309,7 @@ code, secret or key value ever appears in its message.
 | Variant | Means |
 |---|---|
 | `Error::Configuration { message, .. }` | You built the client wrong (no client id, an issuer that is not `https`, a key that does not parse), or parsed an `Acr` outside the vocabulary. A bug in your code, not a bad token |
-| `Error::Exchange { oauth_error, description, status, .. }` | The code exchange at `/token` failed. `oauth_error` and `description` are the provider's, verbatim; `status` is `None` when no response arrived (a timeout, a refused connection) |
+| `Error::Exchange { oauth_error, description, status, .. }` | The code exchange at `/token` failed. `oauth_error` and `description` are the provider's, with control characters removed and at most 300 characters; `status` is `None` when no response arrived (a timeout, a refused connection) |
 | `Error::Verification { reason, .. }` | The ID token did not verify: signature, algorithm, `iss`, `aud`, `exp`, the `nonce`, or the floor. A JWKS that could not be fetched lands here too, because a token that cannot be checked is a token that did not verify |
 | `Error::Userinfo { description, status, .. }` | The `/userinfo` read failed. A returning user matched on `sub` can survive it; a signup that needs the email cannot. A failure is not cached, so a later call retries |
 
@@ -463,6 +471,9 @@ verified `Login`.
   `.issuer(...)` only when you were given a non-production provider. The
   issuer must be `https` (plain `http` is accepted only on a loopback host, for
   tests).
+- **Timeouts.** Each request is bounded by `.timeout(...)` (10 s by default)
+  and each connection attempt by `.connect_timeout(...)` (3 s). Connections to
+  the provider are pooled and reused, over HTTP/2 where offered.
 - **Nothing panics on untrusted input.** Tokens, JWKS documents and provider
   responses are size-capped and parsed defensively; every failure is an
   `Error`.

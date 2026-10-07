@@ -274,7 +274,7 @@ async fn private_key_jwt_signs_a_fresh_rfc7523_assertion() {
         assert_eq!(claims["sub"], CLIENT_ID);
         assert_eq!(claims["aud"], format!("{}/token", p.issuer()));
         let iat = claims["iat"].as_i64().unwrap();
-        assert_eq!(claims["exp"].as_i64().unwrap() - iat, 60);
+        assert_eq!(claims["exp"].as_i64().unwrap() - iat, 50);
         assert!((iat - now()).abs() < 5);
         jtis.push(claims["jti"].as_str().unwrap().to_owned());
     }
@@ -364,6 +364,25 @@ async fn a_userinfo_response_for_another_subject_is_refused() {
 }
 
 #[tokio::test]
+async fn a_userinfo_response_without_a_string_subject_is_refused() {
+    for body in [
+        json!({ "email": "x@example.com" }),
+        json!({ "sub": 1, "email": "x@example.com" }),
+    ] {
+        let p = Provider::start().await;
+        p.serve_jwks(&[&p.key]).await;
+        p.serve_token(&p.key.sign(&base_claims(&p.issuer()))).await;
+        serve_userinfo(&p, body).await;
+        let login = p
+            .client()
+            .authenticate("c", "v", NONCE, None)
+            .await
+            .unwrap();
+        assert!(login.email().await.unwrap_err().is_userinfo());
+    }
+}
+
+#[tokio::test]
 async fn userinfo_is_empty_without_an_access_token() {
     let p = Provider::start().await;
     p.serve_jwks(&[&p.key]).await;
@@ -439,6 +458,7 @@ async fn secrets_and_tokens_stay_out_of_debug_output() {
         !rendered.contains("access-token-value")
             && !rendered.contains(&id_token)
             && !rendered.contains(NONCE)
+            && !rendered.contains("SWE")
     );
 
     let key = Key::generate("k");

@@ -170,6 +170,13 @@ async fn the_wrong_audience_is_refused() {
         json!({ "aud": [CLIENT_ID, "ast_other"], "azp": CLIENT_ID }),
     ));
     verify(&p, &token).await.unwrap();
+
+    // A present azp must be this client, whatever the audience.
+    let token = p.key.sign(&with(
+        base_claims(&p.issuer()),
+        json!({ "azp": "ast_other" }),
+    ));
+    assert_verification(verify(&p, &token).await, "authorized party");
 }
 
 #[tokio::test]

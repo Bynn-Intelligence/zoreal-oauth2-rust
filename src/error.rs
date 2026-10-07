@@ -13,7 +13,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///   a token: a client built without something it cannot work without, a key
 ///   that does not parse, an assurance level outside the vocabulary.
 /// - [`Error::Exchange`]: the code exchange at `/token` failed. The provider's
-///   own error code and description are carried verbatim.
+///   own error code and description are carried, sanitized (control characters removed, at most 300 characters).
 /// - [`Error::Verification`]: the ID token did not verify (signature,
 ///   algorithm, `iss`, `aud`, `exp`, `nonce`, or the assurance floor). A JWKS
 ///   that could not be fetched lands here too, because a token that cannot be
@@ -43,7 +43,7 @@ pub enum Error {
         /// The RFC 6749 error code the provider answered (`invalid_grant`,
         /// `invalid_request`, ...), or `server_error` when it gave none.
         oauth_error: String,
-        /// The provider's own reason, verbatim, or this crate's when the
+        /// The provider's own reason, sanitized, or this crate's when the
         /// request never completed.
         description: String,
         /// The HTTP status, or `None` when no response arrived.
@@ -69,7 +69,7 @@ pub enum Error {
     #[error("zoreal-oauth2: userinfo: {description}")]
     #[non_exhaustive]
     Userinfo {
-        /// The provider's `error_description`, verbatim, or this crate's.
+        /// The provider's `error_description`, sanitized, or this crate's.
         description: String,
         /// The HTTP status, or `None` when no response arrived.
         status: Option<u16>,

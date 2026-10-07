@@ -125,12 +125,13 @@ impl Login {
     }
 
     /// The Tier B claims from `/userinfo`, fetched once and kept. Empty when
-    /// the exchange carried no access token. A response naming a different
-    /// `sub` than the ID token is refused.
+    /// the exchange carried no access token. A response whose `sub` is
+    /// missing or differs from the ID token's is refused.
     ///
     /// An [`Error::Userinfo`] is survivable for a returning user matched on
     /// [`Login::sub`], and fatal for a signup that needs the email. A failed
-    /// fetch is not cached; the next call tries again.
+    /// fetch is not cached: the next call tries again, so read the fields
+    /// from one successful `userinfo()` rather than retrying per field.
     pub async fn userinfo(&self) -> Result<&Userinfo> {
         self.userinfo
             .get_or_try_init(|| async {
@@ -138,14 +139,22 @@ impl Login {
                     return Ok(Userinfo::default());
                 };
                 let info = self.client.userinfo(token).await?;
-                if info.sub().is_some_and(|sub| sub != self.claims.sub) {
-                    return Err(Error::userinfo(
+                // OpenID Connect requires the userinfo `sub` to be present
+                // and to equal the ID token's; anything else is a response
+                // about someone else, or about no one.
+                match info.sub() {
+                    Some(sub) if sub == self.claims.sub => Ok(info),
+                    Some(_) => Err(Error::userinfo(
                         "the userinfo subject is not the ID token subject",
                         None,
                         None,
-                    ));
+                    )),
+                    None => Err(Error::userinfo(
+                        "the userinfo response names no subject",
+                        None,
+                        None,
+                    )),
                 }
-                Ok(info)
             })
             .await
     }

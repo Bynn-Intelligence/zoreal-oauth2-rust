@@ -78,8 +78,9 @@ impl IdTokenClaims {
     }
 }
 
-// The nonce is kept out of Debug output: it travels from the browser to your
-// backend and should go nowhere else, logs included.
+// The nonce and the nationality are kept out of Debug output: the nonce
+// travels from the browser to your backend and should go nowhere else, logs
+// included, and the nationality is personal data.
 impl fmt::Debug for IdTokenClaims {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IdTokenClaims")
@@ -92,7 +93,10 @@ impl fmt::Debug for IdTokenClaims {
             .field("acr", &self.acr)
             .field("amr", &self.amr)
             .field("assurance", &self.assurance)
-            .field("nationality", &self.nationality)
+            .field(
+                "nationality",
+                &self.nationality.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("extra", &self.extra.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }

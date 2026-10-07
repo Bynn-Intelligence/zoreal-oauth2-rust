@@ -17,7 +17,7 @@ include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE", "SECURITY.md"]
 [dependencies]
 base64 = "0.23"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["form", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["form", "http2", "rustls"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.120"
@@ -26,7 +26,7 @@ tokio = { version = "1.40", features = ["sync"] }
 uuid = { version = "1.10", features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "time"] }
 url = "2"
 wiremock = "0.6"
 

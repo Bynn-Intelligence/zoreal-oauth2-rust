@@ -83,11 +83,14 @@ pub const JWKS_TTL: Duration = Duration::from_secs(600);
 /// The default bound on every HTTP request.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The default bound on establishing a connection.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// The default clock skew allowed on `exp`, `nbf` and `iat`. The ID token
 /// lives two minutes, so verify it straight after the exchange.
 pub const DEFAULT_LEEWAY: Duration = Duration::from_secs(30);
 
 /// The lifetime of a `private_key_jwt` client assertion. The provider refuses
-/// an assertion whose `exp` is more than 60 seconds out, so this is the cap,
-/// not a choice.
-pub const ASSERTION_LIFETIME: Duration = Duration::from_secs(60);
+/// an assertion whose `exp` is more than 60 seconds out by its own clock;
+/// 50 seconds leaves room for the relying party's clock to run ahead.
+pub const ASSERTION_LIFETIME: Duration = Duration::from_secs(50);

@@ -13,10 +13,13 @@ use crate::acr::Acr;
 use crate::auth::ClientAuth;
 use crate::claims::{IdTokenClaims, Userinfo};
 use crate::error::{BoxError, Error, Result, sanitize};
-use crate::jwks::{JwksCache, KeySet};
+use crate::jwks::{JwksCache, KeySet, Lookup};
 use crate::jwt::{self, Jws};
 use crate::login::Login;
-use crate::{ASSERTION_LIFETIME, DEFAULT_ISSUER, DEFAULT_LEEWAY, DEFAULT_TIMEOUT, JWKS_TTL};
+use crate::{
+    ASSERTION_LIFETIME, DEFAULT_CONNECT_TIMEOUT, DEFAULT_ISSUER, DEFAULT_LEEWAY, DEFAULT_TIMEOUT,
+    JWKS_TTL,
+};
 
 /// Responses are small JSON documents; a cap keeps a misbehaving endpoint
 /// from ballooning memory.
@@ -66,6 +69,7 @@ pub struct ClientBuilder {
     issuer: String,
     auth: ClientAuth,
     timeout: Duration,
+    connect_timeout: Duration,
     jwks_ttl: Duration,
     leeway: Duration,
 }
@@ -99,6 +103,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Bounds establishing a connection (TCP and TLS). Defaults to
+    /// [`DEFAULT_CONNECT_TIMEOUT`], and never exceeds [`Self::timeout`]. A
+    /// short connect bound fails fast against an unreachable address instead
+    /// of holding a login for the whole request timeout.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
     /// How long the fetched JWKS is held. Defaults to [`JWKS_TTL`], the
     /// provider's own cache lifetime. An unknown `kid` refetches early, so a
     /// key rotation never strands a login for the TTL.
@@ -129,9 +142,9 @@ impl ClientBuilder {
                 "client_secret_basic needs a non-empty client secret",
             ));
         }
-        if self.timeout.is_zero() {
+        if self.timeout.is_zero() || self.connect_timeout.is_zero() {
             return Err(Error::configuration(
-                "the timeout must be greater than zero",
+                "the timeouts must be greater than zero",
             ));
         }
         if self.jwks_ttl.is_zero() {
@@ -173,7 +186,13 @@ impl ClientBuilder {
 
         let mut http = reqwest::Client::builder()
             .timeout(self.timeout)
-            .connect_timeout(self.timeout)
+            .connect_timeout(self.connect_timeout.min(self.timeout))
+            // Logins come in bursts: keep a bounded pool of warm connections
+            // to the one provider host, and drop idle ones before a typical
+            // load balancer's 60-second idle cut-off closes them under a
+            // request.
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(50))
             // Nothing in this flow redirects. Following one would carry the
             // client authentication somewhere it was not meant for.
             .redirect(reqwest::redirect::Policy::none())
@@ -266,7 +285,7 @@ enum ReadError {
 impl ReadError {
     fn into_box(self) -> BoxError {
         match self {
-            ReadError::Transport(e) => Box::new(e),
+            ReadError::Transport(e) => Box::new(e.without_url()),
             ReadError::TooLarge => "the response exceeded the size limit".into(),
         }
     }
@@ -309,6 +328,7 @@ impl Client {
             issuer: DEFAULT_ISSUER.to_owned(),
             auth: ClientAuth::None,
             timeout: DEFAULT_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             jwks_ttl: JWKS_TTL,
             leeway: DEFAULT_LEEWAY,
         }
@@ -451,9 +471,13 @@ impl Client {
         let raw: RawTokenResponse = serde_json::from_slice(&body).map_err(|e| {
             Error::exchange(
                 "server_error",
-                "the token response was not valid JSON",
+                // Not the serde error itself: it can quote a token value.
+                format!(
+                    "the token response was not valid JSON ({})",
+                    json_position(&e)
+                ),
                 Some(status.as_u16()),
-                Some(Box::new(e)),
+                None,
             )
         })?;
         let id_token = raw.id_token.filter(|t| !blank(t)).ok_or_else(|| {
@@ -509,7 +533,13 @@ impl Client {
 
         let payload = jws.payload()?;
         let claims: IdTokenClaims = serde_json::from_slice(&payload)
-            .map_err(|e| Error::verification_with("the ID token claims are malformed", e))?;
+            // Not the serde error itself: it can quote a claim value.
+            .map_err(|e| {
+                Error::verification(format!(
+                    "the ID token claims are malformed ({})",
+                    json_position(&e)
+                ))
+            })?;
         self.check_claims(&claims, nonce, acr_floor)?;
         Ok(claims)
     }
@@ -530,6 +560,15 @@ impl Client {
         if !claims.aud.contains(&inner.client_id) {
             return Err(Error::verification(
                 "the ID token audience is not this client",
+            ));
+        }
+        if claims
+            .azp
+            .as_deref()
+            .is_some_and(|azp| azp != inner.client_id)
+        {
+            return Err(Error::verification(
+                "the ID token's authorized party is not this client",
             ));
         }
         if claims.aud.len() > 1 && claims.azp.as_deref() != Some(inner.client_id.as_str()) {
@@ -620,24 +659,50 @@ impl Client {
         }
 
         let claims: Map<String, Value> = serde_json::from_slice(&body).map_err(|e| {
+            // serde_json errors can quote the offending value, which here is
+            // personal data: keep only the category and position.
             Error::userinfo(
-                "the userinfo response was not a JSON object",
+                format!(
+                    "the userinfo response was not a JSON object ({})",
+                    json_position(&e)
+                ),
                 Some(status.as_u16()),
-                Some(Box::new(e)),
+                None,
             )
         })?;
         Ok(Userinfo::new(claims))
     }
 
     /// The key set to verify a token with this `kid` against. Serves the
-    /// cache while it is fresh; on a miss, refetches once (bounded by
-    /// [`crate::jwks::FORCED_REFETCH_INTERVAL`]) so a key rotation is picked up
-    /// without waiting for the TTL.
+    /// cache while it is fresh and refreshes it ahead of expiry; on an
+    /// unknown `kid`, refetches once (bounded by
+    /// [`crate::jwks::FORCED_REFETCH_INTERVAL`]) so a key rotation is picked
+    /// up without waiting for the TTL.
     async fn keys_for(&self, kid: Option<&str>) -> Result<Arc<KeySet>> {
         let cache = &self.inner.jwks;
-        let set = match cache.fresh() {
-            Some(set) => set,
-            None => self.fetch_jwks(false).await?,
+        let set = match cache.lookup() {
+            Lookup::Fresh(set) => set,
+            Lookup::RefreshAhead(set) => {
+                // One caller refreshes as part of its own request; the others
+                // keep using the current set, which is still within its TTL.
+                // A failed refresh-ahead is remembered and otherwise ignored.
+                match cache.fetch_lock.try_lock() {
+                    Ok(_guard)
+                        if cache.within_soft_ttl().is_none()
+                            && cache.recent_failure().is_none() =>
+                    {
+                        match self.download_jwks().await {
+                            Ok(keys) => cache.store(keys),
+                            Err(err) => {
+                                cache.record_failure(&verification_reason(&err));
+                                set
+                            }
+                        }
+                    }
+                    _ => set,
+                }
+            }
+            Lookup::Expired => self.fetch_jwks(false).await?,
         };
         if set.has(kid) {
             return Ok(set);
@@ -652,30 +717,50 @@ impl Client {
     }
 
     /// Fetches `{issuer}/jwks`, one fetch at a time. A caller that waited for
-    /// another's fetch uses its result instead of fetching again.
+    /// another's attempt takes that attempt's outcome instead of fetching
+    /// again; a recent failure is not retried until
+    /// [`crate::jwks::FAILURE_BACKOFF`] has passed; and while refetching
+    /// fails, a set no older than [`crate::jwks::MAX_STALE`] past its TTL is
+    /// still served.
     async fn fetch_jwks(&self, forced: bool) -> Result<Arc<KeySet>> {
         let cache = &self.inner.jwks;
-        let before = cache.latest();
+        let failed = |reason: &str| {
+            cache
+                .servable()
+                .ok_or_else(|| Error::verification(reason.to_owned()))
+        };
+
+        let generation = cache.generation();
         let _guard = cache.fetch_lock.lock().await;
 
-        let latest = cache.latest();
-        let refreshed_meanwhile = match (&before, &latest) {
-            (Some(b), Some(l)) => !Arc::ptr_eq(b, l),
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        if refreshed_meanwhile && let Some(set) = cache.fresh() {
+        if cache.generation() != generation {
+            if let Some(set) = cache.within_ttl() {
+                return Ok(set);
+            }
+            if let Some(reason) = cache.last_failure() {
+                return failed(&reason);
+            }
+        }
+        if !forced && let Some(set) = cache.within_ttl() {
             return Ok(set);
         }
-        if !forced && let Some(set) = cache.fresh() {
-            return Ok(set);
+        if let Some(reason) = cache.recent_failure() {
+            return failed(&reason);
         }
         if forced && !cache.take_forced_refetch() {
-            return latest.ok_or_else(|| {
-                Error::verification("no key in the provider JWKS matches the ID token")
-            });
+            return failed("no key in the provider JWKS matches the ID token");
         }
 
+        match self.download_jwks().await {
+            Ok(keys) => Ok(cache.store(keys)),
+            Err(err) => {
+                cache.record_failure(&verification_reason(&err));
+                cache.servable().ok_or(err)
+            }
+        }
+    }
+
+    async fn download_jwks(&self) -> Result<KeySet> {
         let inner = &*self.inner;
         let response = inner
             .http
@@ -696,8 +781,24 @@ impl Client {
         let body = read_capped(response).await.map_err(|e| {
             Error::verification_with("could not read the provider JWKS", e.into_box())
         })?;
-        let keys = jwt::parse_jwks(&body)?;
-        Ok(cache.store(KeySet::new(keys)))
+        Ok(KeySet::new(jwt::parse_jwks(&body)?))
+    }
+}
+
+/// A serde_json error's category and position, without the value it quotes.
+fn json_position(err: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {}, column {}",
+        err.classify(),
+        err.line(),
+        err.column()
+    )
+}
+
+fn verification_reason(err: &Error) -> String {
+    match err {
+        Error::Verification { reason, .. } => reason.clone(),
+        other => other.to_string(),
     }
 }
 
