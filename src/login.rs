@@ -1,10 +1,13 @@
 //! One verified login.
 
 use std::fmt;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use secrecy::SecretString;
 use tokio::sync::OnceCell;
 
+use crate::USERINFO_RETRY_AFTER;
 use crate::acr::Acr;
 use crate::claims::{Assurance, IdTokenClaims, Userinfo};
 use crate::client::{Client, TokenResponse};
@@ -24,7 +27,21 @@ pub struct Login {
     access_token: Option<SecretString>,
     scope: Option<String>,
     userinfo: OnceCell<Userinfo>,
+    /// The last failed userinfo read, repeated without a request for
+    /// [`USERINFO_RETRY_AFTER`].
+    userinfo_failed: Mutex<Option<Failure>>,
 }
+
+struct Failure {
+    at: Instant,
+    description: String,
+    status: Option<u16>,
+}
+
+/// The source of a repeated userinfo failure.
+#[derive(Debug, thiserror::Error)]
+#[error("the previous userinfo read failed moments ago; not retried yet")]
+struct Repeated;
 
 impl Login {
     pub(crate) fn new(client: Client, claims: IdTokenClaims, tokens: TokenResponse) -> Self {
@@ -35,6 +52,7 @@ impl Login {
             access_token: tokens.access_token,
             scope: tokens.scope,
             userinfo: OnceCell::new(),
+            userinfo_failed: Mutex::new(None),
         }
     }
 
@@ -129,34 +147,94 @@ impl Login {
     /// missing or differs from the ID token's is refused.
     ///
     /// An [`Error::Userinfo`] is survivable for a returning user matched on
-    /// [`Login::sub`], and fatal for a signup that needs the email. A failed
-    /// fetch is not cached: the next call tries again, so read the fields
-    /// from one successful `userinfo()` rather than retrying per field.
+    /// [`Login::sub`], and fatal for a signup that needs the email. A
+    /// refusal or a bad answer from the provider is repeated from memory for
+    /// [`USERINFO_RETRY_AFTER`] (same description and status, no request), so
+    /// accessors called one after another make one request between them;
+    /// after that the next call asks the provider again. A transport failure
+    /// is not remembered and keeps its source.
     pub async fn userinfo(&self) -> Result<&Userinfo> {
+        if let Some(info) = self.userinfo.get() {
+            return Ok(info);
+        }
+        if let Some(repeated) = self.recent_failure() {
+            return Err(repeated);
+        }
         self.userinfo
             .get_or_try_init(|| async {
-                let Some(token) = &self.access_token else {
-                    return Ok(Userinfo::default());
-                };
-                let info = self.client.userinfo(token).await?;
-                // OpenID Connect requires the userinfo `sub` to be present
-                // and to equal the ID token's; anything else is a response
-                // about someone else, or about no one.
-                match info.sub() {
-                    Some(sub) if sub == self.claims.sub => Ok(info),
-                    Some(_) => Err(Error::userinfo(
-                        "the userinfo subject is not the ID token subject",
-                        None,
-                        None,
-                    )),
-                    None => Err(Error::userinfo(
-                        "the userinfo response names no subject",
-                        None,
-                        None,
-                    )),
+                // Checked again here: a caller that was waiting for the
+                // cell sees the failure the one before it just recorded.
+                if let Some(repeated) = self.recent_failure() {
+                    return Err(repeated);
                 }
+                let fetched = self.fetch_userinfo().await;
+                if let Err(error) = &fetched {
+                    self.remember(error);
+                }
+                fetched
             })
             .await
+    }
+
+    async fn fetch_userinfo(&self) -> Result<Userinfo> {
+        let Some(token) = &self.access_token else {
+            return Ok(Userinfo::default());
+        };
+        let info = self.client.userinfo(token).await?;
+        // OpenID Connect requires the userinfo `sub` to be present and to
+        // equal the ID token's; anything else is a response about someone
+        // else, or about no one.
+        match info.sub() {
+            Some(sub) if sub == self.claims.sub => Ok(info),
+            Some(_) => Err(Error::userinfo(
+                "the userinfo subject is not the ID token subject",
+                None,
+                None,
+            )),
+            None => Err(Error::userinfo(
+                "the userinfo response names no subject",
+                None,
+                None,
+            )),
+        }
+    }
+
+    /// Remembers a fetched failure. Only an answer is remembered: a
+    /// transport failure (no response, or a body cut off) keeps its source
+    /// and is retried straight away, so a caller can still tell an outage
+    /// from a refusal.
+    fn remember(&self, error: &Error) {
+        if let Error::Userinfo {
+            description,
+            status,
+            source,
+        } = error
+            && !source.as_ref().is_some_and(|s| s.is::<reqwest::Error>())
+        {
+            *self.failed_slot() = Some(Failure {
+                at: Instant::now(),
+                description: description.clone(),
+                status: *status,
+            });
+        }
+    }
+
+    fn failed_slot(&self) -> std::sync::MutexGuard<'_, Option<Failure>> {
+        self.userinfo_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn recent_failure(&self) -> Option<Error> {
+        let slot = self.failed_slot();
+        let failure = slot.as_ref()?;
+        (failure.at.elapsed() < USERINFO_RETRY_AFTER).then(|| {
+            Error::userinfo(
+                failure.description.clone(),
+                failure.status,
+                Some(Box::new(Repeated)),
+            )
+        })
     }
 
     /// `email` scope, from `/userinfo`.

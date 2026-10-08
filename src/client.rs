@@ -196,6 +196,9 @@ impl ClientBuilder {
             // Nothing in this flow redirects. Following one would carry the
             // client authentication somewhere it was not meant for.
             .redirect(reqwest::redirect::Policy::none())
+            // Every endpoint is the issuer's, so an https issuer never
+            // talks plain http; http stays possible on loopback only.
+            .https_only(https_only(&token_url))
             .user_agent(concat!("zoreal-oauth2-rust/", env!("CARGO_PKG_VERSION")));
         if let ClientAuth::TlsClientAuth(identity) = &self.auth {
             http = http.identity(identity.identity.clone());
@@ -319,6 +322,28 @@ fn blank(value: &str) -> bool {
     value.trim().is_empty()
 }
 
+/// Whether the HTTP client refuses plain http: always, unless the issuer is
+/// itself http (which the builder allows on loopback only).
+fn https_only(endpoint: &Url) -> bool {
+    endpoint.scheme() == "https"
+}
+
+/// `application/x-www-form-urlencoded` for one value: ASCII letters and
+/// digits and `*-._` stay, a space becomes `+`, every other byte is `%XX`.
+fn form_urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                out.push(char::from(byte));
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 impl Client {
     /// Starts a builder for the client whose `client_id` (the asset token,
     /// `ast_...`) is given.
@@ -427,7 +452,13 @@ impl Client {
             .header(reqwest::header::ACCEPT, "application/json")
             .form(&form);
         if let ClientAuth::ClientSecretBasic(secret) = &inner.auth {
-            request = request.basic_auth(&inner.client_id, Some(secret.expose_secret()));
+            // RFC 6749 section 2.3.1: both halves are form-urlencoded before
+            // they are joined and base64-encoded.
+            let encoded = SecretString::from(form_urlencode(secret.expose_secret()));
+            request = request.basic_auth(
+                form_urlencode(&inner.client_id),
+                Some(encoded.expose_secret()),
+            );
         }
 
         let response = request.send().await.map_err(|e| {
@@ -811,4 +842,26 @@ fn check_nonce_param(nonce: &str) -> Result<()> {
         return Err(Error::verification("the nonce is too long"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Url, form_urlencode, https_only};
+
+    #[test]
+    fn an_https_issuer_gets_an_https_only_client() {
+        assert!(https_only(
+            &Url::parse("https://id.zoreal.com/token").unwrap()
+        ));
+        assert!(!https_only(
+            &Url::parse("http://127.0.0.1:8080/token").unwrap()
+        ));
+    }
+
+    #[test]
+    fn basic_credentials_are_form_urlencoded() {
+        assert_eq!(form_urlencode("ast_Qn-X.y*9"), "ast_Qn-X.y*9");
+        assert_eq!(form_urlencode("a b:c%d+e/f"), "a+b%3Ac%25d%2Be%2Ff");
+        assert_eq!(form_urlencode("\u{e9}"), "%C3%A9");
+    }
 }

@@ -94,3 +94,7 @@ pub const DEFAULT_LEEWAY: Duration = Duration::from_secs(30);
 /// an assertion whose `exp` is more than 60 seconds out by its own clock;
 /// 50 seconds leaves room for the relying party's clock to run ahead.
 pub const ASSERTION_LIFETIME: Duration = Duration::from_secs(50);
+
+/// How long a failed userinfo read on a [`Login`] is repeated from memory
+/// before the next call asks the provider again.
+pub const USERINFO_RETRY_AFTER: Duration = Duration::from_secs(2);

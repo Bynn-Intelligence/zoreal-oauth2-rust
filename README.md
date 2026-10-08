@@ -251,7 +251,7 @@ cache lifetime), shared by every clone of the client:
 | Method | Configuration | Notes |
 |---|---|---|
 | `none` | `ClientAuth::None` (the default) | Public client: PKCE is the only proof, Tier A scopes only |
-| `client_secret_basic` | `.client_secret(secret)` or `ClientAuth::client_secret_basic(secret)` | The secret travels as HTTP Basic, never as a form field |
+| `client_secret_basic` | `.client_secret(secret)` or `ClientAuth::client_secret_basic(secret)` | The secret travels as HTTP Basic (client id and secret form-urlencoded first, as RFC 6749 section 2.3.1 requires), never as a form field |
 | `private_key_jwt` | `ClientAuth::PrivateKeyJwt(PrivateKey::from_pem(pem)?.with_kid("..."))` | The crate signs a fresh RFC 7523 assertion per exchange: ES256 with a P-256 key, `iss` = `sub` = client id, `aud` = `{issuer}/token`, a 50-second lifetime (inside the provider's 60-second cap, with room for clock skew), single-use `jti`. The key never travels |
 | `tls_client_auth` | `ClientAuth::TlsClientAuth(TlsIdentity::from_pem(cert_chain, &key)?)` | The certificate rides the TLS handshake on every request. The provider accepts the method at registration but answers 501 at the token endpoint today, which surfaces as the `Error::Exchange` it is |
 
@@ -311,7 +311,7 @@ code, secret or key value ever appears in its message.
 | `Error::Configuration { message, .. }` | You built the client wrong (no client id, an issuer that is not `https`, a key that does not parse), or parsed an `Acr` outside the vocabulary. A bug in your code, not a bad token |
 | `Error::Exchange { oauth_error, description, status, .. }` | The code exchange at `/token` failed. `oauth_error` and `description` are the provider's, with control characters removed and at most 300 characters; `status` is `None` when no response arrived (a timeout, a refused connection) |
 | `Error::Verification { reason, .. }` | The ID token did not verify: signature, algorithm, `iss`, `aud`, `exp`, the `nonce`, or the floor. A JWKS that could not be fetched lands here too, because a token that cannot be checked is a token that did not verify |
-| `Error::Userinfo { description, status, .. }` | The `/userinfo` read failed. A returning user matched on `sub` can survive it; a signup that needs the email cannot. A failure is not cached, so a later call retries |
+| `Error::Userinfo { description, status, .. }` | The `/userinfo` read failed. A returning user matched on `sub` can survive it; a signup that needs the email cannot. A refused or malformed answer is repeated without a request for two seconds (`USERINFO_RETRY_AFTER`), then a later call retries; a transport failure is retried at once |
 
 `err.oauth_error()`, `err.status()` and `err.is_configuration()` /
 `is_exchange()` / `is_verification()` / `is_userinfo()` save a `match` where

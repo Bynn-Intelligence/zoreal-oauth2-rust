@@ -290,6 +290,31 @@ async fn a_sec1_pem_key_is_accepted_too() {
 }
 
 #[tokio::test]
+async fn basic_credentials_are_form_urlencoded_before_base64() {
+    let p = Provider::start().await;
+    p.serve_jwks(&[&p.key]).await;
+    p.serve_token(&p.key.sign(&base_claims(&p.issuer()))).await;
+    p.client_with(ClientAuth::client_secret_basic("s3cr:t+/% x"))
+        .authenticate("c", "v", NONCE, None)
+        .await
+        .unwrap();
+    let request = &p.requests_to("/token").await[0];
+    let expected = format!(
+        "Basic {}",
+        STANDARD.encode(format!("{CLIENT_ID}:s3cr%3At%2B%2F%25+x"))
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
 async fn a_public_client_sends_no_authorization_header() {
     let p = Provider::start().await;
     p.serve_jwks(&[&p.key]).await;
@@ -304,7 +329,7 @@ async fn a_public_client_sends_no_authorization_header() {
 }
 
 #[tokio::test]
-async fn a_userinfo_failure_is_a_userinfo_error_and_is_retried() {
+async fn a_userinfo_failure_is_repeated_briefly_then_retried() {
     let p = Provider::start().await;
     p.serve_jwks(&[&p.key]).await;
     p.serve_token(&p.key.sign(&base_claims(&p.issuer()))).await;
@@ -340,9 +365,72 @@ async fn a_userinfo_failure_is_a_userinfo_error_and_is_retried() {
         }
         other => panic!("expected a userinfo error, got {other:?}"),
     }
-    // The login itself is still usable, and a failure is not cached.
+    // The next accessors repeat the failure without a request.
     assert_eq!(login.sub(), "TC5X-JN7G-YTSE-6E63");
+    let repeated = login.name().await.unwrap_err();
+    assert_eq!(repeated.status(), Some(401));
+    assert!(
+        repeated
+            .to_string()
+            .contains("the access token is not valid")
+    );
+    assert_eq!(p.requests_to("/userinfo").await.len(), 1);
+    // Once the pause is over the provider is asked again.
+    tokio::time::sleep(zoreal_oauth2::USERINFO_RETRY_AFTER + std::time::Duration::from_millis(100))
+        .await;
     assert_eq!(login.email().await.unwrap(), Some("holder@example.com"));
+    assert_eq!(p.requests_to("/userinfo").await.len(), 2);
+}
+
+#[tokio::test]
+async fn concurrent_accessors_share_one_failed_userinfo_read() {
+    let p = Provider::start().await;
+    p.serve_jwks(&[&p.key]).await;
+    p.serve_token(&p.key.sign(&base_claims(&p.issuer()))).await;
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({ "error": "invalid_token" })))
+        .mount(&p.server)
+        .await;
+    let login = p
+        .client()
+        .authenticate("c", "v", NONCE, None)
+        .await
+        .unwrap();
+    let (a, b, c) = tokio::join!(login.email(), login.name(), login.birthdate());
+    assert!(a.is_err() && b.is_err() && c.is_err());
+    assert_eq!(p.requests_to("/userinfo").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_userinfo_transport_failure_is_not_remembered() {
+    let p = Provider::start().await;
+    p.serve_jwks(&[&p.key]).await;
+    p.serve_token(&p.key.sign(&base_claims(&p.issuer()))).await;
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(2))
+                .set_body_json(json!({ "sub": "TC5X-JN7G-YTSE-6E63" })),
+        )
+        .mount(&p.server)
+        .await;
+    let client = zoreal_oauth2::Client::builder(CLIENT_ID)
+        .issuer(p.issuer())
+        .client_secret(SECRET)
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let login = client.authenticate("c", "v", NONCE, None).await.unwrap();
+    for _ in 0..2 {
+        let error = login.email().await.unwrap_err();
+        assert!(error.is_userinfo());
+        assert_eq!(error.status(), None);
+        let source = std::error::Error::source(&error).expect("the transport error");
+        assert!(source.is::<reqwest::Error>(), "{source:?}");
+    }
+    assert_eq!(p.requests_to("/userinfo").await.len(), 2, "retried at once");
 }
 
 #[tokio::test]
